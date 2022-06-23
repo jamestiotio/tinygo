@@ -509,6 +509,15 @@ func (v pointerValue) addOffset(offset uint32) pointerValue {
 	return result
 }
 
+// subOffset is the inverse of addOffset.
+func (v pointerValue) subOffset(offset uint32) pointerValue {
+	result := pointerValue{v.pointer - uint64(offset)}
+	if checks && v.index() != result.index() {
+		panic("interp: offset out of range")
+	}
+	return result
+}
+
 func (v pointerValue) len(r *runner) uint32 {
 	return r.pointerSize
 }
@@ -813,7 +822,7 @@ func (v rawValue) rawLLVMValue(mem *memoryView) (llvm.Value, error) {
 				// There are some special pointer types that should be used as a
 				// ptrtoint, so that they can be used in certain optimizations.
 				name := elementType.StructName()
-				if name == "runtime.typecodeID" || name == "runtime.funcValueWithSignature" {
+				if name == "runtime.funcValueWithSignature" {
 					uintptrType := ctx.IntType(int(mem.r.pointerSize) * 8)
 					field = llvm.ConstPtrToInt(field, uintptrType)
 				}

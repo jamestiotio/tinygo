@@ -15,6 +15,39 @@ import (
 	"tinygo.org/x/go-llvm"
 )
 
+// Type kinds for basic types.
+// They must match the constants for the Kind type in src/reflect/type.go.
+var basicTypes = [...]uint8{
+	types.Bool:          1,
+	types.Int:           2,
+	types.Int8:          3,
+	types.Int16:         4,
+	types.Int32:         5,
+	types.Int64:         6,
+	types.Uint:          7,
+	types.Uint8:         8,
+	types.Uint16:        9,
+	types.Uint32:        10,
+	types.Uint64:        11,
+	types.Uintptr:       12,
+	types.Float32:       13,
+	types.Float64:       14,
+	types.Complex64:     15,
+	types.Complex128:    16,
+	types.String:        17,
+	types.UnsafePointer: 18,
+
+	// named types are as follows:
+	// chan:      19
+	// interface: 20
+	// pointer:   21
+	// slice:     22
+	// array:     23
+	// signature: 24
+	// map:       25
+	// struct:    26
+}
+
 // createMakeInterface emits the LLVM IR for the *ssa.MakeInterface instruction.
 // It tries to put the type in the interface value, but if that's not possible,
 // it will do an allocation of the right size and put that in the interface
@@ -23,10 +56,9 @@ import (
 // An interface value is a {typecode, value} tuple named runtime._interface.
 func (b *builder) createMakeInterface(val llvm.Value, typ types.Type, pos token.Pos) llvm.Value {
 	itfValue := b.emitPointerPack([]llvm.Value{val})
-	itfTypeCodeGlobal := b.getTypeCode(typ)
-	itfTypeCode := b.CreatePtrToInt(itfTypeCodeGlobal, b.uintptrType, "")
+	itfType := b.getTypeCode(typ)
 	itf := llvm.Undef(b.getLLVMRuntimeType("_interface"))
-	itf = b.CreateInsertValue(itf, itfTypeCode, 0, "")
+	itf = b.CreateInsertValue(itf, itfType, 0, "")
 	itf = b.CreateInsertValue(itf, itfValue, 1, "")
 	return itf
 }
@@ -41,118 +73,243 @@ func (b *builder) extractValueFromInterface(itf llvm.Value, llvmType llvm.Type) 
 }
 
 // getTypeCode returns a reference to a type code.
-// It returns a pointer to an external global which should be replaced with the
-// real type in the interface lowering pass.
+// A type code is a pointer to a constant global that describes the type.
+// This function returns a pointer to the 'kind' field (which might not be the
+// first field in the struct).
 func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
+	ms := c.program.MethodSets.MethodSet(typ)
+	hasMethodSet := ms.Len() != 0
+	if _, ok := typ.Underlying().(*types.Interface); ok {
+		hasMethodSet = false
+	}
 	globalName := "reflect/types.type:" + getTypeCodeName(typ)
 	global := c.mod.NamedGlobal(globalName)
 	if global.IsNil() {
-		// Create a new typecode global.
-		global = llvm.AddGlobal(c.mod, c.getLLVMRuntimeType("typecodeID"), globalName)
-		// Some type classes contain more information for underlying types or
-		// element types. Store it directly in the typecode global to make
-		// reflect lowering simpler.
-		var references llvm.Value
-		var length int64
-		var methodSet llvm.Value
-		var ptrTo llvm.Value
-		var typeAssert llvm.Value
+		var typeFields []llvm.Value
+		// Define the type fields. These must match the structs in
+		// src/reflect/type.go (ptrType, arrayType, etc):
+		//   basic:
+		//     kind, ptrTo
+		//   named:
+		//     kind, ptrTo, underlying
+		//   chan, slice:
+		//     kind, ptrTo, elementType
+		//   pointer:
+		//     kind, elementType
+		//   array:
+		//     kind, ptrTo, elementType, length
+		//   map:
+		//     kind, ptrTo, [todo: elemType, keyType]
+		//   struct:
+		//     kind, numFields, ptrTo, fields...
+		//   interface:
+		//     kind, ptrTo, numMethods, methods...
+		//   signature:
+		//     kind, [todo]
+		typeFieldTypes := []*types.Var{
+			types.NewVar(token.NoPos, nil, "kind", types.Typ[types.Int8]),
+		}
 		switch typ := typ.(type) {
+		case *types.Basic:
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+			)
 		case *types.Named:
-			references = c.getTypeCode(typ.Underlying())
-		case *types.Chan:
-			references = c.getTypeCode(typ.Elem())
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "underlying", types.Typ[types.UnsafePointer]),
+			)
+		case *types.Chan, *types.Slice:
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "elementType", types.Typ[types.UnsafePointer]),
+			)
 		case *types.Pointer:
-			references = c.getTypeCode(typ.Elem())
-		case *types.Slice:
-			references = c.getTypeCode(typ.Elem())
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "elementType", types.Typ[types.UnsafePointer]),
+			)
 		case *types.Array:
-			references = c.getTypeCode(typ.Elem())
-			length = typ.Len()
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "elementType", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "length", types.Typ[types.Uintptr]),
+			)
+		case *types.Map:
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+			)
 		case *types.Struct:
-			// Take a pointer to the typecodeID of the first field (if it exists).
-			structGlobal := c.makeStructTypeFields(typ)
-			references = llvm.ConstBitCast(structGlobal, global.Type())
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "numFields", types.Typ[types.Uint16]),
+				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "fields", types.NewArray(c.getRuntimeType("structField"), int64(typ.NumFields()))),
+			)
 		case *types.Interface:
-			methodSetGlobal := c.getInterfaceMethodSet(typ)
-			references = llvm.ConstBitCast(methodSetGlobal, global.Type())
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+			)
+			// TODO: methods
+		case *types.Signature:
+			typeFieldTypes = append(typeFieldTypes,
+				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+			)
+			// TODO: signature params and return values
 		}
-		if _, ok := typ.Underlying().(*types.Interface); !ok {
-			methodSet = c.getTypeMethodSet(typ)
-		} else {
-			typeAssert = c.getInterfaceImplementsFunc(typ)
-			typeAssert = llvm.ConstPtrToInt(typeAssert, c.uintptrType)
+		if hasMethodSet {
+			typeFieldTypes = append([]*types.Var{
+				types.NewVar(token.NoPos, nil, "methodSet", types.Typ[types.UnsafePointer]),
+			}, typeFieldTypes...)
 		}
-		if _, ok := typ.Underlying().(*types.Pointer); !ok {
-			ptrTo = c.getTypeCode(types.NewPointer(typ))
+		globalType := types.NewStruct(typeFieldTypes, nil)
+		global = llvm.AddGlobal(c.mod, c.getLLVMType(globalType), globalName)
+		metabyte := getTypeKind(typ)
+		switch typ := typ.(type) {
+		case *types.Basic:
+			typeFields = []llvm.Value{c.getTypeCode(types.NewPointer(typ))}
+		case *types.Named:
+			typeFields = []llvm.Value{
+				c.getTypeCode(types.NewPointer(typ)), // ptrTo
+				c.getTypeCode(typ.Underlying()),      // underlying
+			}
+			metabyte |= 1 << 5 // "named" flag
+		case *types.Chan:
+			typeFields = []llvm.Value{
+				c.getTypeCode(types.NewPointer(typ)), // ptrTo
+				c.getTypeCode(typ.Elem()),            // elementType
+			}
+		case *types.Slice:
+			typeFields = []llvm.Value{
+				c.getTypeCode(types.NewPointer(typ)), // ptrTo
+				c.getTypeCode(typ.Elem()),            // elementType
+			}
+		case *types.Pointer:
+			typeFields = []llvm.Value{c.getTypeCode(typ.Elem())}
+		case *types.Array:
+			typeFields = []llvm.Value{
+				c.getTypeCode(types.NewPointer(typ)),                   // ptrTo
+				c.getTypeCode(typ.Elem()),                              // elementType
+				llvm.ConstInt(c.uintptrType, uint64(typ.Len()), false), // length
+			}
+		case *types.Map:
+			typeFields = []llvm.Value{
+				c.getTypeCode(types.NewPointer(typ)), // ptrTo
+			}
+		case *types.Struct:
+			typeFields = []llvm.Value{
+				llvm.ConstInt(c.ctx.Int16Type(), uint64(typ.NumFields()), false), // numFields
+				c.getTypeCode(types.NewPointer(typ)),                             // ptrTo
+			}
+			structFieldType := c.getLLVMRuntimeType("structField")
+			var fields []llvm.Value
+			for i := 0; i < typ.NumFields(); i++ {
+				field := typ.Field(i)
+				var flags uint8
+				if field.Anonymous() {
+					flags |= 1
+				}
+				if typ.Tag(i) != "" {
+					flags |= 2
+				}
+				if token.IsExported(field.Name()) {
+					flags |= 4
+				}
+				data := string(flags) + field.Name()
+				if typ.Tag(i) != "" {
+					data += "\x00" + typ.Tag(i)
+				}
+				dataInitializer := c.ctx.ConstString(data, true)
+				dataGlobal := llvm.AddGlobal(c.mod, dataInitializer.Type(), globalName+"."+field.Name())
+				dataGlobal.SetInitializer(dataInitializer)
+				dataGlobal.SetAlignment(1)
+				dataGlobal.SetUnnamedAddr(true)
+				dataGlobal.SetLinkage(llvm.InternalLinkage)
+				dataGlobal.SetGlobalConstant(true)
+				fieldType := c.getTypeCode(field.Type())
+				fields = append(fields, llvm.ConstNamedStruct(structFieldType, []llvm.Value{
+					fieldType,
+					llvm.ConstGEP(dataGlobal, []llvm.Value{
+						llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+						llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+					}),
+				}))
+			}
+			typeFields = append(typeFields, llvm.ConstArray(structFieldType, fields))
+		case *types.Interface:
+			typeFields = []llvm.Value{c.getTypeCode(types.NewPointer(typ))}
+			// TODO: methods
+		case *types.Signature:
+			typeFields = []llvm.Value{c.getTypeCode(types.NewPointer(typ))}
+			// TODO: params, return values, etc
 		}
-		globalValue := llvm.ConstNull(global.Type().ElementType())
-		if !references.IsNil() {
-			globalValue = llvm.ConstInsertValue(globalValue, references, []uint32{0})
+		// Prepend metadata byte.
+		typeFields = append([]llvm.Value{
+			llvm.ConstInt(c.ctx.Int8Type(), uint64(metabyte), false),
+		}, typeFields...)
+		if hasMethodSet {
+			typeFields = append([]llvm.Value{
+				llvm.ConstBitCast(c.getTypeMethodSet(typ), c.i8ptrType),
+			}, typeFields...)
 		}
-		if length != 0 {
-			lengthValue := llvm.ConstInt(c.uintptrType, uint64(length), false)
-			globalValue = llvm.ConstInsertValue(globalValue, lengthValue, []uint32{1})
-		}
-		if !methodSet.IsNil() {
-			globalValue = llvm.ConstInsertValue(globalValue, methodSet, []uint32{2})
-		}
-		if !ptrTo.IsNil() {
-			globalValue = llvm.ConstInsertValue(globalValue, ptrTo, []uint32{3})
-		}
-		if !typeAssert.IsNil() {
-			globalValue = llvm.ConstInsertValue(globalValue, typeAssert, []uint32{4})
-		}
+		alignment := c.targetData.TypeAllocSize(c.i8ptrType)
+		globalValue := c.ctx.ConstStruct(typeFields, false)
 		global.SetInitializer(globalValue)
 		global.SetLinkage(llvm.LinkOnceODRLinkage)
 		global.SetGlobalConstant(true)
-	}
-	return global
-}
-
-// makeStructTypeFields creates a new global that stores all type information
-// related to this struct type, and returns the resulting global. This global is
-// actually an array of all the fields in the structs.
-func (c *compilerContext) makeStructTypeFields(typ *types.Struct) llvm.Value {
-	// The global is an array of runtime.structField structs.
-	runtimeStructField := c.getLLVMRuntimeType("structField")
-	structGlobalType := llvm.ArrayType(runtimeStructField, typ.NumFields())
-	structGlobal := llvm.AddGlobal(c.mod, structGlobalType, "reflect/types.structFields")
-	structGlobalValue := llvm.ConstNull(structGlobalType)
-	for i := 0; i < typ.NumFields(); i++ {
-		fieldGlobalValue := llvm.ConstNull(runtimeStructField)
-		fieldGlobalValue = llvm.ConstInsertValue(fieldGlobalValue, c.getTypeCode(typ.Field(i).Type()), []uint32{0})
-		fieldName := c.makeGlobalArray([]byte(typ.Field(i).Name()), "reflect/types.structFieldName", c.ctx.Int8Type())
-		fieldName.SetLinkage(llvm.PrivateLinkage)
-		fieldName.SetUnnamedAddr(true)
-		fieldName = llvm.ConstGEP(fieldName, []llvm.Value{
-			llvm.ConstInt(c.ctx.Int32Type(), 0, false),
-			llvm.ConstInt(c.ctx.Int32Type(), 0, false),
-		})
-		fieldGlobalValue = llvm.ConstInsertValue(fieldGlobalValue, fieldName, []uint32{1})
-		if typ.Tag(i) != "" {
-			fieldTag := c.makeGlobalArray([]byte(typ.Tag(i)), "reflect/types.structFieldTag", c.ctx.Int8Type())
-			fieldTag.SetLinkage(llvm.PrivateLinkage)
-			fieldTag.SetUnnamedAddr(true)
-			fieldTag = llvm.ConstGEP(fieldTag, []llvm.Value{
-				llvm.ConstInt(c.ctx.Int32Type(), 0, false),
-				llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+		global.SetAlignment(int(alignment))
+		if c.Debug {
+			file := c.getDIFile("<Go type>")
+			diglobal := c.dibuilder.CreateGlobalVariableExpression(file, llvm.DIGlobalVariableExpression{
+				Name:        "type " + typ.String(),
+				File:        file,
+				Line:        1,
+				Type:        c.getDIType(globalType),
+				LocalToUnit: false,
+				Expr:        c.dibuilder.CreateExpression(nil),
+				AlignInBits: uint32(alignment * 8),
 			})
-			fieldGlobalValue = llvm.ConstInsertValue(fieldGlobalValue, fieldTag, []uint32{2})
+			global.AddMetadata(0, diglobal)
 		}
-		if typ.Field(i).Embedded() {
-			fieldEmbedded := llvm.ConstInt(c.ctx.Int1Type(), 1, false)
-			fieldGlobalValue = llvm.ConstInsertValue(fieldGlobalValue, fieldEmbedded, []uint32{3})
-		}
-		structGlobalValue = llvm.ConstInsertValue(structGlobalValue, fieldGlobalValue, []uint32{uint32(i)})
 	}
-	structGlobal.SetInitializer(structGlobalValue)
-	structGlobal.SetUnnamedAddr(true)
-	structGlobal.SetLinkage(llvm.PrivateLinkage)
-	return structGlobal
+	offset := uint64(0)
+	if hasMethodSet {
+		// The GEP has to point to the 'kind' field, which may not be at the
+		// start of the struct.
+		offset = 1
+	}
+	return llvm.ConstGEP(global, []llvm.Value{
+		llvm.ConstInt(llvm.Int32Type(), 0, false),
+		llvm.ConstInt(llvm.Int32Type(), offset, false),
+	})
 }
 
-var basicTypes = [...]string{
+// getTypeKind returns the type kind for the given type, as defined by
+// reflect.Kind.
+func getTypeKind(t types.Type) uint8 {
+	switch t := t.Underlying().(type) {
+	case *types.Basic:
+		return basicTypes[t.Kind()]
+	case *types.Chan:
+		return 19
+	case *types.Interface:
+		return 20
+	case *types.Pointer:
+		return 21
+	case *types.Slice:
+		return 22
+	case *types.Array:
+		return 23
+	case *types.Signature:
+		return 24
+	case *types.Map:
+		return 25
+	case *types.Struct:
+		return 26
+	default:
+		panic("unknown type")
+	}
+}
+
+var basicTypeNames = [...]string{
 	types.Bool:          "bool",
 	types.Int:           "int",
 	types.Int8:          "int8",
@@ -183,7 +340,7 @@ func getTypeCodeName(t types.Type) string {
 	case *types.Array:
 		return "array:" + strconv.FormatInt(t.Len(), 10) + ":" + getTypeCodeName(t.Elem())
 	case *types.Basic:
-		return "basic:" + basicTypes[t.Kind()]
+		return "basic:" + basicTypeNames[t.Kind()]
 	case *types.Chan:
 		return "chan:" + getTypeCodeName(t.Elem())
 	case *types.Interface:
@@ -235,75 +392,40 @@ func getTypeCodeName(t types.Type) string {
 // getTypeMethodSet returns a reference (GEP) to a global method set. This
 // method set should be unreferenced after the interface lowering pass.
 func (c *compilerContext) getTypeMethodSet(typ types.Type) llvm.Value {
-	global := c.mod.NamedGlobal(typ.String() + "$methodset")
-	zero := llvm.ConstInt(c.ctx.Int32Type(), 0, false)
-	if !global.IsNil() {
-		// the method set already exists
-		return llvm.ConstGEP(global, []llvm.Value{zero, zero})
-	}
+	globalName := typ.String() + "$methodset"
+	global := c.mod.NamedGlobal(globalName)
+	if global.IsNil() {
+		ms := c.program.MethodSets.MethodSet(typ)
 
-	ms := c.program.MethodSets.MethodSet(typ)
-	if ms.Len() == 0 {
-		// no methods, so can leave that one out
-		return llvm.ConstPointerNull(llvm.PointerType(c.getLLVMRuntimeType("interfaceMethodInfo"), 0))
-	}
-
-	methods := make([]llvm.Value, ms.Len())
-	interfaceMethodInfoType := c.getLLVMRuntimeType("interfaceMethodInfo")
-	for i := 0; i < ms.Len(); i++ {
-		method := ms.At(i)
-		signatureGlobal := c.getMethodSignature(method.Obj().(*types.Func))
-		fn := c.program.MethodValue(method)
-		llvmFn := c.getFunction(fn)
-		if llvmFn.IsNil() {
-			// compiler error, so panic
-			panic("cannot find function: " + c.getFunctionInfo(fn).linkName)
+		// Create method set.
+		var signatures, wrappers []llvm.Value
+		for i := 0; i < ms.Len(); i++ {
+			method := ms.At(i)
+			signatureGlobal := c.getMethodSignature(method.Obj().(*types.Func))
+			signatures = append(signatures, signatureGlobal)
+			fn := c.program.MethodValue(method)
+			llvmFn := c.getFunction(fn)
+			if llvmFn.IsNil() {
+				// compiler error, so panic
+				panic("cannot find function: " + c.getFunctionInfo(fn).linkName)
+			}
+			wrapper := c.getInterfaceInvokeWrapper(fn, llvmFn)
+			wrappers = append(wrappers, wrapper)
 		}
-		wrapper := c.getInterfaceInvokeWrapper(fn, llvmFn)
-		methodInfo := llvm.ConstNamedStruct(interfaceMethodInfoType, []llvm.Value{
-			signatureGlobal,
-			llvm.ConstPtrToInt(wrapper, c.uintptrType),
-		})
-		methods[i] = methodInfo
-	}
-	arrayType := llvm.ArrayType(interfaceMethodInfoType, len(methods))
-	value := llvm.ConstArray(interfaceMethodInfoType, methods)
-	global = llvm.AddGlobal(c.mod, arrayType, typ.String()+"$methodset")
-	global.SetInitializer(value)
-	global.SetGlobalConstant(true)
-	global.SetLinkage(llvm.LinkOnceODRLinkage)
-	return llvm.ConstGEP(global, []llvm.Value{zero, zero})
-}
 
-// getInterfaceMethodSet returns a global variable with the method set of the
-// given named interface type. This method set is used by the interface lowering
-// pass.
-func (c *compilerContext) getInterfaceMethodSet(typ types.Type) llvm.Value {
-	name := typ.String()
-	if _, ok := typ.(*types.Named); !ok {
-		// Anonymous interface.
-		name = "reflect/types.interface:" + name
+		// Construct global value.
+		globalValue := c.ctx.ConstStruct([]llvm.Value{
+			llvm.ConstInt(c.uintptrType, uint64(ms.Len()), false),
+			llvm.ConstArray(c.i8ptrType, signatures),
+			c.ctx.ConstStruct(wrappers, false),
+		}, false)
+		global = llvm.AddGlobal(c.mod, globalValue.Type(), globalName)
+		global.SetInitializer(globalValue)
+		global.SetGlobalConstant(true)
+		global.SetUnnamedAddr(true)
+		global.SetLinkage(llvm.LinkOnceODRLinkage)
 	}
-	global := c.mod.NamedGlobal(name + "$interface")
-	zero := llvm.ConstInt(c.ctx.Int32Type(), 0, false)
-	if !global.IsNil() {
-		// method set already exist, return it
-		return llvm.ConstGEP(global, []llvm.Value{zero, zero})
-	}
-
-	// Every method is a *i8 reference indicating the signature of this method.
-	methods := make([]llvm.Value, typ.Underlying().(*types.Interface).NumMethods())
-	for i := range methods {
-		method := typ.Underlying().(*types.Interface).Method(i)
-		methods[i] = c.getMethodSignature(method)
-	}
-
-	value := llvm.ConstArray(c.i8ptrType, methods)
-	global = llvm.AddGlobal(c.mod, value.Type(), name+"$interface")
-	global.SetInitializer(value)
-	global.SetGlobalConstant(true)
-	global.SetLinkage(llvm.LinkOnceODRLinkage)
-	return llvm.ConstGEP(global, []llvm.Value{zero, zero})
+	return global
 }
 
 // getMethodSignatureName returns a unique name (that can be used as the name of
@@ -443,7 +565,7 @@ func (c *compilerContext) getInterfaceImplementsFunc(assertedType types.Type) ll
 	fnName := getTypeCodeName(assertedType.Underlying()) + ".$typeassert"
 	llvmFn := c.mod.NamedFunction(fnName)
 	if llvmFn.IsNil() {
-		llvmFnType := llvm.FunctionType(c.ctx.Int1Type(), []llvm.Type{c.uintptrType}, false)
+		llvmFnType := llvm.FunctionType(c.ctx.Int1Type(), []llvm.Type{c.i8ptrType}, false)
 		llvmFn = llvm.AddFunction(c.mod, fnName, llvmFnType)
 		c.addStandardDeclaredAttributes(llvmFn)
 		methods := c.getMethodsString(assertedType.Underlying().(*types.Interface))
@@ -464,7 +586,7 @@ func (c *compilerContext) getInvokeFunction(instr *ssa.CallCommon) llvm.Value {
 		for i := 0; i < sig.Params().Len(); i++ {
 			paramTuple = append(paramTuple, sig.Params().At(i))
 		}
-		paramTuple = append(paramTuple, types.NewVar(token.NoPos, nil, "$typecode", types.Typ[types.Uintptr]))
+		paramTuple = append(paramTuple, types.NewVar(token.NoPos, nil, "$typecode", types.Typ[types.UnsafePointer]))
 		llvmFnType := c.getRawFuncType(types.NewSignature(sig.Recv(), types.NewTuple(paramTuple...), sig.Results(), false)).ElementType()
 		llvmFn = llvm.AddFunction(c.mod, fnName, llvmFnType)
 		c.addStandardDeclaredAttributes(llvmFn)
@@ -602,7 +724,7 @@ func typestring(t types.Type) string {
 	case *types.Array:
 		return "[" + strconv.FormatInt(t.Len(), 10) + "]" + typestring(t.Elem())
 	case *types.Basic:
-		return basicTypes[t.Kind()]
+		return basicTypeNames[t.Kind()]
 	case *types.Chan:
 		switch t.Dir() {
 		case types.SendRecv:

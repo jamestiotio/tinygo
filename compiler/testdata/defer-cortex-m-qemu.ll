@@ -5,7 +5,7 @@ target triple = "thumbv7m-unknown-unknown-eabi"
 
 %runtime._defer = type { i32, %runtime._defer* }
 %runtime.deferFrame = type { i8*, i8*, [0 x i8*], %runtime.deferFrame*, i1, %runtime._interface }
-%runtime._interface = type { i32, i8* }
+%runtime._interface = type { i8*, i8* }
 
 declare noalias nonnull i8* @runtime.alloc(i32, i8*, i8*) #0
 
